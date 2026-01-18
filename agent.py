@@ -40,7 +40,14 @@ TRIGGER_PHRASES: dict[str, str] = {
     "man down": "man_down",
     "officer down": "officer_down",
     "suspect down": "suspect_down",
+    "camera blocked": "camera_blocked",
+    "camera obscured": "camera_blocked",
 }
+
+
+def _extract_trigger_events(text: str) -> set[str]:
+    lowered = text.lower()
+    return {event for phrase, event in TRIGGER_PHRASES.items() if phrase in lowered}
 
 
 def _post_event_sync(url: str, payload: dict[str, Any]) -> tuple[int, str]:
@@ -90,36 +97,46 @@ class TranscriberAgent(Agent):
         context: RunContext,
         transcript: str,
     ) -> dict[str, Any]:
-        trunk_id = os.getenv("LIVEKIT_SIP_TRUNK_ID")
-        if not trunk_id:
-            raise RuntimeError("Missing LIVEKIT_SIP_TRUNK_ID for outbound SIP calls.")
-        room_name = self.room_name or os.getenv("LIVEKIT_SIP_ROOM_NAME", "sip-alerts")
-        participant_identity = f"sip-alert-{int(time.time())}"
-
-        request = CreateSIPParticipantRequest(
-            sip_trunk_id=trunk_id,
-            sip_call_to=OUTBOUND_PHONE_NUMBER,
-            room_name=room_name,
-            participant_identity=participant_identity,
-            participant_name="Shots Fired Alert",
-            krisp_enabled=True,
-            wait_until_answered=False,
+        return await _dispatch_outbound_call(
+            transcript=transcript,
+            room_name=self.room_name,
         )
 
-        livekit_api = lk_api.LiveKitAPI()
-        try:
-            participant = await livekit_api.sip.create_sip_participant(request)
-        finally:
-            await livekit_api.aclose()
 
-        logger.warning(
-            "Outbound call dispatched to %s (room=%s, participant=%s) for: %s",
-            OUTBOUND_PHONE_NUMBER,
-            room_name,
-            participant_identity,
-            transcript,
-        )
-        return {"participant": str(participant)}
+async def _dispatch_outbound_call(
+    transcript: str,
+    room_name: str | None,
+) -> dict[str, Any]:
+    trunk_id = os.getenv("LIVEKIT_SIP_TRUNK_ID")
+    if not trunk_id:
+        raise RuntimeError("Missing LIVEKIT_SIP_TRUNK_ID for outbound SIP calls.")
+    target_room = room_name or os.getenv("LIVEKIT_SIP_ROOM_NAME", "sip-alerts")
+    participant_identity = f"sip-alert-{int(time.time())}"
+
+    request = CreateSIPParticipantRequest(
+        sip_trunk_id=trunk_id,
+        sip_call_to=OUTBOUND_PHONE_NUMBER,
+        room_name=target_room,
+        participant_identity=participant_identity,
+        participant_name="Shots Fired Alert",
+        krisp_enabled=True,
+        wait_until_answered=False,
+    )
+
+    livekit_api = lk_api.LiveKitAPI()
+    try:
+        participant = await livekit_api.sip.create_sip_participant(request)
+    finally:
+        await livekit_api.aclose()
+
+    logger.warning(
+        "Outbound call dispatched to %s (room=%s, participant=%s) for: %s",
+        OUTBOUND_PHONE_NUMBER,
+        target_room,
+        participant_identity,
+        transcript,
+    )
+    return {"participant": str(participant)}
 
 server = AgentServer()
 
@@ -147,6 +164,67 @@ async def entrypoint(ctx: JobContext):
         ),
     )
 
+    active_text_tasks: set[asyncio.Task] = set()
+
+    async def _handle_text_stream(reader, participant_identity: str) -> None:
+        info = reader.info
+        stream_id = getattr(info, "id", None)
+        stream_id = stream_id or getattr(info, "stream_id", None)
+        size = getattr(info, "size", None)
+        logger.info(
+            "Text stream received from %s (topic=%s, id=%s, size=%s)",
+            participant_identity,
+            info.topic,
+            stream_id,
+            size,
+        )
+        try:
+            text = await reader.read_all()
+        except Exception as exc:
+            logger.warning("Text stream read failed: %s", exc)
+            return
+        if text:
+            logger.info("Text stream content: %s", text)
+            matched_events = _extract_trigger_events(text)
+            if matched_events:
+                for event in matched_events:
+                    if event == "shots_fired":
+                        continue
+                    asyncio.create_task(
+                        _send_event_to_chain(
+                            event=event,
+                            transcript=text,
+                            room_name=ctx.room.name,
+                        )
+                    )
+            if "shots_fired" in matched_events:
+                logger.warning(
+                    "Audio trigger detected in text stream (room=%s): %s",
+                    ctx.room.name,
+                    text,
+                )
+                await _send_event_to_chain(
+                    event="shots_fired",
+                    transcript=text,
+                    room_name=ctx.room.name,
+                )
+                asyncio.create_task(
+                    _dispatch_outbound_call(
+                        transcript=text,
+                        room_name=ctx.room.name,
+                    )
+                )
+
+    def _register_text_stream(reader, participant_identity: str) -> None:
+        task = asyncio.create_task(_handle_text_stream(reader, participant_identity))
+        active_text_tasks.add(task)
+        task.add_done_callback(lambda t: active_text_tasks.discard(t))
+
+    ctx.room.register_text_stream_handler(
+        "video.description",
+        _register_text_stream,
+    )
+
     @session.on("user_input_transcribed")
     def _on_transcript(transcript) -> None:
         text = (transcript.transcript or "").strip()
@@ -157,10 +235,7 @@ async def entrypoint(ctx: JobContext):
         if not is_final:
             return
 
-        lowered = text.lower()
-        matched_events = {
-            event for phrase, event in TRIGGER_PHRASES.items() if phrase in lowered
-        }
+        matched_events = _extract_trigger_events(text)
         for event in matched_events:
             asyncio.create_task(
                 _send_event_to_chain(
