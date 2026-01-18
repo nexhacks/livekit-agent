@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LiveKit Camera Publisher</title>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+        margin: 24px;
+      }
+      .row {
+        margin-bottom: 12px;
+      }
+      input {
+        width: 420px;
+        max-width: 100%;
+        padding: 6px 8px;
+      }
+      button {
+        padding: 6px 10px;
+      }
+      video {
+        margin-top: 16px;
+        width: 480px;
+        max-width: 100%;
+        background: #000;
+      }
+      .status {
+        margin-top: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Publish Camera</h1>
+    <div class="row">
+      <label>
+        LiveKit URL
+        <input id="url" placeholder="wss://your-livekit-domain" />
+      </label>
+    </div>
+    <div class="row">
+      <label>
+        Access Token
+        <input id="token" placeholder="lk_token_..." />
+      </label>
+    </div>
+    <div class="row">
+      <button id="connect">Connect + Publish</button>
+      <button id="disconnect" disabled>Disconnect</button>
+    </div>
+    <div class="status" id="status">Disconnected</div>
+    <video id="preview" autoplay playsinline muted></video>
+
+    <script src="https://unpkg.com/livekit-client/dist/livekit-client.umd.js"></script>
+    <script>
+      const statusEl = document.getElementById("status");
+      const connectBtn = document.getElementById("connect");
+      const disconnectBtn = document.getElementById("disconnect");
+      const preview = document.getElementById("preview");
+      const urlInput = document.getElementById("url");
+      const tokenInput = document.getElementById("token");
+
+      let room = null;
+
+      function setStatus(text) {
+        statusEl.textContent = text;
+      }
+
+      connectBtn.addEventListener("click", async () => {
+        const url = urlInput.value.trim();
+        const token = tokenInput.value.trim();
+        if (!url || !token) {
+          setStatus("Please enter LiveKit URL and token.");
+          return;
+        }
+
+        try {
+          setStatus("Connecting...");
+          room = new LiveKit.Room();
+          await room.connect(url, token);
+
+          setStatus("Publishing camera + mic...");
+          await room.localParticipant.setCameraEnabled(true);
+          await room.localParticipant.setMicrophoneEnabled(true);
+
+          const videoTrack = room.localParticipant.getTrackPublication(
+            LiveKit.Track.Source.Camera
+          )?.track;
+          if (videoTrack) {
+            videoTrack.attach(preview);
+          }
+
+          connectBtn.disabled = true;
+          disconnectBtn.disabled = false;
+          setStatus("Publishing");
+        } catch (err) {
+          console.error(err);
+          setStatus("Failed to connect or publish.");
+        }
+      });
+
+      disconnectBtn.addEventListener("click", async () => {
+        if (room) {
+          room.disconnect();
+          room = null;
+        }
+        preview.srcObject = null;
+        connectBtn.disabled = false;
+        disconnectBtn.disabled = true;
+        setStatus("Disconnected");
+      });
+    </script>
+  </body>
+</html>
+
